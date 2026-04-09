@@ -233,11 +233,30 @@ static LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
 }
 
 static LRESULT CALLBACK KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
-    if (nCode >= 0 && g_needTaint) {
+    if (nCode >= 0) {
         KBDLLHOOKSTRUCT *kb = (KBDLLHOOKSTRUCT *)lParam;
+
+        /* Win key-up: taint if needed */
         if ((kb->vkCode == VK_LWIN || kb->vkCode == VK_RWIN) && wParam == WM_KEYUP) {
-            g_needTaint = FALSE;
-            TaintWinKey();
+            if (g_needTaint) {
+                g_needTaint = FALSE;
+                TaintWinKey();
+            }
+        }
+
+        /* Win+X: close window under cursor */
+        if (kb->vkCode == 'X' && wParam == WM_KEYDOWN && IsWinKeyDown()) {
+            POINT pt;
+            GetCursorPos(&pt);
+            HWND hwnd = WindowFromPoint(pt);
+            if (hwnd) {
+                hwnd = GetTopLevelWindow(hwnd);
+                if (IsDraggableWindow(hwnd)) {
+                    PostMessage(hwnd, WM_CLOSE, 0, 0);
+                    g_needTaint = TRUE;
+                    return 1; /* swallow so Win+X power menu doesn't open */
+                }
+            }
         }
     }
     return CallNextHookEx(g_kbHook, nCode, wParam, lParam);
