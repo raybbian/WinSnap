@@ -1,5 +1,5 @@
 /*
- * WinSnap - Hold Alt + left-click anywhere to drag windows.
+ * WinSnap - Win+LeftClick to drag, Win+RightClick to resize by quadrant.
  *
  * Build: cl winsnap.c /link user32.lib shell32.lib /SUBSYSTEM:WINDOWS /MANIFESTUAC:"level='requireAdministrator'"
  *    or: gcc winsnap.c -o winsnap.exe -mwindows -lshell32
@@ -12,19 +12,22 @@
 #define WM_TRAYICON   (WM_USER + 1)
 #define ID_TRAY_EXIT  1001
 
+enum Action { ACTION_NONE, ACTION_MOVE, ACTION_RESIZE };
+
 static HHOOK          g_mouseHook;
 static HHOOK          g_kbHook;
-static BOOL           g_dragging;
-static BOOL           g_didDrag;
-static BOOL           g_moved;       /* TRUE if mouse actually moved during drag */
-static BOOL           g_taintedMid;  /* TRUE if we already tainted mid-drag (Win released before mouse) */
+static enum Action    g_action;
+static BOOL           g_needTaint;    /* an action happened, taint next Win key-up */
 static HWND           g_dragWindow;
 static POINT          g_dragStart;
-static POINT          g_windowStart;
+static POINT          g_windowStart;  /* top-left at drag start (for move) */
+static RECT           g_windowRect;   /* full rect at drag start (for resize) */
+static int            g_resizeEdgeX;  /* -1 = left, +1 = right */
+static int            g_resizeEdgeY;  /* -1 = top,  +1 = bottom */
 static HWND           g_hwndMsg;
 static NOTIFYICONDATA g_nid;
 
-static BOOL IsAltKeyDown(void) {
+static BOOL IsWinKeyDown(void) {
     return (GetAsyncKeyState(VK_LWIN) & 0x8000) ||
            (GetAsyncKeyState(VK_RWIN) & 0x8000);
 }
@@ -42,29 +45,47 @@ static HWND GetTopLevelWindow(HWND hwnd) {
     return hwnd;
 }
 
+static BOOL IsDraggableWindow(HWND hwnd) {
+    if (!hwnd || hwnd == GetDesktopWindow() || hwnd == GetShellWindow())
+        return FALSE;
+
+    TCHAR cls[64] = {0};
+    GetClassName(hwnd, cls, 64);
+    if (lstrcmp(cls, TEXT("WorkerW")) == 0 ||
+        lstrcmp(cls, TEXT("Progman")) == 0 ||
+        lstrcmp(cls, TEXT("Shell_TrayWnd")) == 0 ||
+        lstrcmp(cls, TEXT("Shell_SecondaryTrayWnd")) == 0)
+        return FALSE;
+
+    LONG style = GetWindowLong(hwnd, GWL_STYLE);
+    if (!(style & WS_THICKFRAME))
+        return FALSE;
+
+    return TRUE;
+}
+
+static void TaintWinKey(void) {
+    INPUT inputs[2] = {0};
+    inputs[0].type = INPUT_KEYBOARD;
+    inputs[0].ki.wVk = VK_NONAME;
+    inputs[1].type = INPUT_KEYBOARD;
+    inputs[1].ki.wVk = VK_NONAME;
+    inputs[1].ki.dwFlags = KEYEVENTF_KEYUP;
+    SendInput(2, inputs, sizeof(INPUT));
+}
+
 static LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (nCode < 0)
         return CallNextHookEx(g_mouseHook, nCode, wParam, lParam);
 
     MSLLHOOKSTRUCT *ms = (MSLLHOOKSTRUCT *)lParam;
 
-    if (wParam == WM_LBUTTONDOWN && IsAltKeyDown()) {
+    /* --- Start MOVE on Win + Left Click --- */
+    if (wParam == WM_LBUTTONDOWN && g_action == ACTION_NONE && IsWinKeyDown()) {
         HWND hwnd = WindowFromPoint(ms->pt);
         if (hwnd) {
             hwnd = GetTopLevelWindow(hwnd);
-            if (hwnd && hwnd != GetDesktopWindow() && hwnd != GetShellWindow()) {
-                /* Skip non-draggable windows: desktop, taskbar, etc. */
-                TCHAR cls[64] = {0};
-                GetClassName(hwnd, cls, 64);
-                if (lstrcmp(cls, TEXT("WorkerW")) == 0 ||
-                    lstrcmp(cls, TEXT("Progman")) == 0 ||
-                    lstrcmp(cls, TEXT("Shell_TrayWnd")) == 0 ||
-                    lstrcmp(cls, TEXT("Shell_SecondaryTrayWnd")) == 0)
-                    goto pass_through;
-
-                LONG style = GetWindowLong(hwnd, GWL_STYLE);
-                if (!(style & WS_THICKFRAME))
-                    goto pass_through;
+            if (IsDraggableWindow(hwnd)) {
                 if (IsZoomed(hwnd)) {
                     ShowWindow(hwnd, SW_RESTORE);
 
@@ -86,63 +107,105 @@ static LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
                 }
 
                 SetForegroundWindow(hwnd);
-                g_dragWindow = hwnd;
-                g_dragStart  = ms->pt;
-                g_dragging   = TRUE;
-                g_moved      = FALSE;
-                g_taintedMid = FALSE;
-
+                g_dragWindow  = hwnd;
+                g_dragStart   = ms->pt;
+                g_action      = ACTION_MOVE;
+                g_needTaint   = TRUE;
                 return 1;
             }
         }
     }
 
-    if (wParam == WM_MOUSEMOVE && g_dragging) {
+    /* --- Start RESIZE on Win + Right Click --- */
+    if (wParam == WM_RBUTTONDOWN && g_action == ACTION_NONE && IsWinKeyDown()) {
+        HWND hwnd = WindowFromPoint(ms->pt);
+        if (hwnd) {
+            hwnd = GetTopLevelWindow(hwnd);
+            if (IsDraggableWindow(hwnd)) {
+                if (IsZoomed(hwnd))
+                    ShowWindow(hwnd, SW_RESTORE);
+
+                RECT wr;
+                GetWindowRect(hwnd, &wr);
+                g_windowRect = wr;
+
+                /* Determine quadrant */
+                int midX = (wr.left + wr.right) / 2;
+                int midY = (wr.top + wr.bottom) / 2;
+                g_resizeEdgeX = (ms->pt.x < midX) ? -1 : 1;
+                g_resizeEdgeY = (ms->pt.y < midY) ? -1 : 1;
+
+                SetForegroundWindow(hwnd);
+                g_dragWindow  = hwnd;
+                g_dragStart   = ms->pt;
+                g_action      = ACTION_RESIZE;
+                g_needTaint   = TRUE;
+                return 1;
+            }
+        }
+    }
+
+    /* --- Mouse move --- */
+    if (wParam == WM_MOUSEMOVE && g_action == ACTION_MOVE) {
         int dx = ms->pt.x - g_dragStart.x;
         int dy = ms->pt.y - g_dragStart.y;
         if (dx != 0 || dy != 0) {
-            g_moved = TRUE;
             SetWindowPos(g_dragWindow, NULL,
                          g_windowStart.x + dx, g_windowStart.y + dy, 0, 0,
                          SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
         }
     }
 
-    if (wParam == WM_LBUTTONUP && g_dragging) {
-        g_dragging   = FALSE;
-        g_didDrag    = g_moved && !g_taintedMid;
-        g_dragWindow = NULL;
+    if (wParam == WM_MOUSEMOVE && g_action == ACTION_RESIZE) {
+        int dx = ms->pt.x - g_dragStart.x;
+        int dy = ms->pt.y - g_dragStart.y;
 
+        int left   = g_windowRect.left;
+        int top    = g_windowRect.top;
+        int right  = g_windowRect.right;
+        int bottom = g_windowRect.bottom;
+
+        if (g_resizeEdgeX == -1) left  += dx; else right  += dx;
+        if (g_resizeEdgeY == -1) top   += dy; else bottom += dy;
+
+        /* Enforce minimum size */
+        int minW = GetSystemMetrics(SM_CXMINTRACK);
+        int minH = GetSystemMetrics(SM_CYMINTRACK);
+        if (right - left < minW) {
+            if (g_resizeEdgeX == -1) left = right - minW; else right = left + minW;
+        }
+        if (bottom - top < minH) {
+            if (g_resizeEdgeY == -1) top = bottom - minH; else bottom = top + minH;
+        }
+
+        SetWindowPos(g_dragWindow, NULL,
+                     left, top, right - left, bottom - top,
+                     SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+
+    /* --- End move on left button up --- */
+    if (wParam == WM_LBUTTONUP && g_action == ACTION_MOVE) {
+        g_action     = ACTION_NONE;
+        g_dragWindow = NULL;
         return 1;
     }
 
-pass_through:
+    /* --- End resize on right button up --- */
+    if (wParam == WM_RBUTTONUP && g_action == ACTION_RESIZE) {
+        g_action     = ACTION_NONE;
+        g_dragWindow = NULL;
+        return 1;
+    }
+
     return CallNextHookEx(g_mouseHook, nCode, wParam, lParam);
 }
 
-static void TaintWinKey(void) {
-    INPUT inputs[2] = {0};
-    inputs[0].type = INPUT_KEYBOARD;
-    inputs[0].ki.wVk = VK_NONAME;
-    inputs[1].type = INPUT_KEYBOARD;
-    inputs[1].ki.wVk = VK_NONAME;
-    inputs[1].ki.dwFlags = KEYEVENTF_KEYUP;
-    SendInput(2, inputs, sizeof(INPUT));
-}
-
 static LRESULT CALLBACK KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
-    if (nCode >= 0) {
+    if (nCode >= 0 && g_needTaint) {
         KBDLLHOOKSTRUCT *kb = (KBDLLHOOKSTRUCT *)lParam;
         if ((kb->vkCode == VK_LWIN || kb->vkCode == VK_RWIN) && wParam == WM_KEYUP) {
-            if (g_dragging && g_moved) {
-                /* Win released mid-drag — taint now, skip taint on mouse-up */
-                g_taintedMid = TRUE;
-                TaintWinKey();
-            } else if (g_didDrag) {
-                /* Win released after drag ended */
-                g_didDrag = FALSE;
-                TaintWinKey();
-            }
+            g_needTaint = FALSE;
+            TaintWinKey();
         }
     }
     return CallNextHookEx(g_kbHook, nCode, wParam, lParam);
@@ -198,7 +261,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
     g_nid.uFlags           = NIF_ICON | NIF_TIP | NIF_MESSAGE;
     g_nid.uCallbackMessage = WM_TRAYICON;
     g_nid.hIcon            = LoadIcon(NULL, IDI_APPLICATION);
-    lstrcpy(g_nid.szTip, TEXT("WinSnap - Alt+Drag to move windows"));
+    lstrcpy(g_nid.szTip, TEXT("WinSnap - Win+Drag/Resize windows"));
     Shell_NotifyIcon(NIM_ADD, &g_nid);
 
     /* Install hooks */
