@@ -18,12 +18,15 @@ static HHOOK          g_mouseHook;
 static HHOOK          g_kbHook;
 static enum Action    g_action;
 static BOOL           g_needTaint;    /* an action happened, taint next Win key-up */
+static BOOL           g_wasZoomed;    /* window was zoomed at drag start, defer restore */
 static HWND           g_dragWindow;
 static POINT          g_dragStart;
 static POINT          g_windowStart;  /* top-left at drag start (for move) */
 static RECT           g_windowRect;   /* full rect at drag start (for resize) */
 static int            g_resizeEdgeX;  /* -1 = left, +1 = right */
 static int            g_resizeEdgeY;  /* -1 = top,  +1 = bottom */
+static DWORD          g_lastClickTime;  /* for double-click detection */
+static POINT          g_lastClickPt;
 static HWND           g_hwndMsg;
 static NOTIFYICONDATA g_nid;
 
@@ -80,26 +83,39 @@ static LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
 
     MSLLHOOKSTRUCT *ms = (MSLLHOOKSTRUCT *)lParam;
 
-    /* --- Start MOVE on Win + Left Click --- */
-    if (wParam == WM_LBUTTONDOWN && g_action == ACTION_NONE && IsWinKeyDown()) {
+    /* --- Start MOVE on Win + Left Click (with double-click detection) --- */
+    if (wParam == WM_LBUTTONDOWN && IsWinKeyDown()) {
         HWND hwnd = WindowFromPoint(ms->pt);
         if (hwnd) {
             hwnd = GetTopLevelWindow(hwnd);
             if (IsDraggableWindow(hwnd)) {
-                if (IsZoomed(hwnd)) {
-                    ShowWindow(hwnd, SW_RESTORE);
+                DWORD now = ms->time;
+                DWORD dblClickTime = GetDoubleClickTime();
+                int cxDbl = GetSystemMetrics(SM_CXDOUBLECLK) / 2;
+                int cyDbl = GetSystemMetrics(SM_CYDOUBLECLK) / 2;
+                BOOL isDblClick = (now - g_lastClickTime <= dblClickTime) &&
+                    abs(ms->pt.x - g_lastClickPt.x) <= cxDbl &&
+                    abs(ms->pt.y - g_lastClickPt.y) <= cyDbl;
+                g_lastClickTime = now;
+                g_lastClickPt   = ms->pt;
 
-                    RECT wr;
-                    GetWindowRect(hwnd, &wr);
-                    int winW = wr.right - wr.left;
-                    int winH = wr.bottom - wr.top;
-                    int newX = ms->pt.x - winW / 2;
-                    int newY = ms->pt.y - winH / 2;
-                    SetWindowPos(hwnd, NULL, newX, newY, winW, winH,
-                                 SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-                    g_windowStart.x = newX;
-                    g_windowStart.y = newY;
-                } else {
+                if (isDblClick) {
+                    /* Double click: toggle maximize */
+                    if (IsZoomed(hwnd))
+                        ShowWindow(hwnd, SW_RESTORE);
+                    else
+                        ShowWindow(hwnd, SW_MAXIMIZE);
+                    g_needTaint  = TRUE;
+                    g_action     = ACTION_NONE;
+                    g_dragWindow = NULL;
+                    g_lastClickTime = 0; /* prevent triple-click */
+                    return 1;
+                }
+
+                /* Single click: start move */
+                g_wasZoomed = IsZoomed(hwnd);
+
+                if (!g_wasZoomed) {
                     RECT wr;
                     GetWindowRect(hwnd, &wr);
                     g_windowStart.x = wr.left;
@@ -121,10 +137,7 @@ static LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
         HWND hwnd = WindowFromPoint(ms->pt);
         if (hwnd) {
             hwnd = GetTopLevelWindow(hwnd);
-            if (IsDraggableWindow(hwnd)) {
-                if (IsZoomed(hwnd))
-                    ShowWindow(hwnd, SW_RESTORE);
-
+            if (IsDraggableWindow(hwnd) && !IsZoomed(hwnd)) {
                 RECT wr;
                 GetWindowRect(hwnd, &wr);
                 g_windowRect = wr;
@@ -150,9 +163,28 @@ static LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
         int dx = ms->pt.x - g_dragStart.x;
         int dy = ms->pt.y - g_dragStart.y;
         if (dx != 0 || dy != 0) {
-            SetWindowPos(g_dragWindow, NULL,
-                         g_windowStart.x + dx, g_windowStart.y + dy, 0, 0,
-                         SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            /* Deferred restore: only unzoom when the mouse actually moves */
+            if (g_wasZoomed) {
+                g_wasZoomed = FALSE;
+                ShowWindow(g_dragWindow, SW_RESTORE);
+
+                RECT wr;
+                GetWindowRect(g_dragWindow, &wr);
+                int winW = wr.right - wr.left;
+                int winH = wr.bottom - wr.top;
+                int newX = ms->pt.x - winW / 2;
+                int newY = ms->pt.y - winH / 2;
+                SetWindowPos(g_dragWindow, NULL, newX, newY, winW, winH,
+                             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+                /* Reset drag origin so movement is smooth from here */
+                g_windowStart.x = newX;
+                g_windowStart.y = newY;
+                g_dragStart = ms->pt;
+            } else {
+                SetWindowPos(g_dragWindow, NULL,
+                             g_windowStart.x + dx, g_windowStart.y + dy, 0, 0,
+                             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            }
         }
     }
 
