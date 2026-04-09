@@ -16,6 +16,8 @@ static HHOOK          g_mouseHook;
 static HHOOK          g_kbHook;
 static BOOL           g_dragging;
 static BOOL           g_didDrag;
+static BOOL           g_moved;       /* TRUE if mouse actually moved during drag */
+static BOOL           g_taintedMid;  /* TRUE if we already tainted mid-drag (Win released before mouse) */
 static HWND           g_dragWindow;
 static POINT          g_dragStart;
 static POINT          g_windowStart;
@@ -61,29 +63,21 @@ static LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
                     goto pass_through;
 
                 LONG style = GetWindowLong(hwnd, GWL_STYLE);
-                if (!(style & WS_CAPTION) && !(style & WS_THICKFRAME))
+                if (!(style & WS_THICKFRAME))
                     goto pass_through;
                 if (IsZoomed(hwnd)) {
-                    RECT wr;
-                    GetWindowRect(hwnd, &wr);
-                    HMONITOR hMon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
-                    MONITORINFO mi = { sizeof(mi) };
-                    GetMonitorInfo(hMon, &mi);
-                    int monW = mi.rcWork.right - mi.rcWork.left;
-                    float pct = (float)(ms->pt.x - mi.rcWork.left) / monW;
-
                     ShowWindow(hwnd, SW_RESTORE);
 
+                    RECT wr;
                     GetWindowRect(hwnd, &wr);
                     int winW = wr.right - wr.left;
                     int winH = wr.bottom - wr.top;
-                    int newX = ms->pt.x - (int)(pct * winW);
-                    int newY = ms->pt.y - 10;
+                    int newX = ms->pt.x - winW / 2;
+                    int newY = ms->pt.y - winH / 2;
                     SetWindowPos(hwnd, NULL, newX, newY, winW, winH,
                                  SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-                    GetWindowRect(hwnd, &wr);
-                    g_windowStart.x = wr.left;
-                    g_windowStart.y = wr.top;
+                    g_windowStart.x = newX;
+                    g_windowStart.y = newY;
                 } else {
                     RECT wr;
                     GetWindowRect(hwnd, &wr);
@@ -95,6 +89,8 @@ static LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
                 g_dragWindow = hwnd;
                 g_dragStart  = ms->pt;
                 g_dragging   = TRUE;
+                g_moved      = FALSE;
+                g_taintedMid = FALSE;
 
                 return 1;
             }
@@ -104,14 +100,17 @@ static LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (wParam == WM_MOUSEMOVE && g_dragging) {
         int dx = ms->pt.x - g_dragStart.x;
         int dy = ms->pt.y - g_dragStart.y;
-        SetWindowPos(g_dragWindow, NULL,
-                     g_windowStart.x + dx, g_windowStart.y + dy, 0, 0,
-                     SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        if (dx != 0 || dy != 0) {
+            g_moved = TRUE;
+            SetWindowPos(g_dragWindow, NULL,
+                         g_windowStart.x + dx, g_windowStart.y + dy, 0, 0,
+                         SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
     }
 
     if (wParam == WM_LBUTTONUP && g_dragging) {
         g_dragging   = FALSE;
-        g_didDrag    = TRUE;
+        g_didDrag    = g_moved && !g_taintedMid;
         g_dragWindow = NULL;
 
         return 1;
@@ -132,11 +131,18 @@ static void TaintWinKey(void) {
 }
 
 static LRESULT CALLBACK KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
-    if (nCode >= 0 && (g_dragging || g_didDrag)) {
+    if (nCode >= 0) {
         KBDLLHOOKSTRUCT *kb = (KBDLLHOOKSTRUCT *)lParam;
         if ((kb->vkCode == VK_LWIN || kb->vkCode == VK_RWIN) && wParam == WM_KEYUP) {
-            g_didDrag = FALSE;
-            TaintWinKey();
+            if (g_dragging && g_moved) {
+                /* Win released mid-drag — taint now, skip taint on mouse-up */
+                g_taintedMid = TRUE;
+                TaintWinKey();
+            } else if (g_didDrag) {
+                /* Win released after drag ended */
+                g_didDrag = FALSE;
+                TaintWinKey();
+            }
         }
     }
     return CallNextHookEx(g_kbHook, nCode, wParam, lParam);
