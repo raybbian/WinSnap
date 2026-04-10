@@ -260,6 +260,8 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
     if (GetLastError() == ERROR_ALREADY_EXISTS)
         return 0;
 
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
     /* Install hooks */
     g_mouseHook = SetWindowsHookEx(WH_MOUSE_LL, MouseProc, hInst, 0);
     g_kbHook    = SetWindowsHookEx(WH_KEYBOARD_LL, KeyboardProc, hInst, 0);
