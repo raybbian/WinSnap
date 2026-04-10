@@ -1,17 +1,12 @@
 /*
  * WinSnap - Win+LeftClick to drag, Win+RightClick to resize by quadrant.
  *
- * Build: cl winsnap.c /link user32.lib shell32.lib /SUBSYSTEM:WINDOWS /MANIFESTUAC:"level='requireAdministrator'"
- *    or: gcc winsnap.c -o winsnap.exe -mwindows -lshell32
+ * Build: cl winsnap.c /link user32.lib /SUBSYSTEM:WINDOWS
+ *    or: gcc winsnap.c -o winsnap.exe -mwindows
  */
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#include <shellapi.h>
-
-#define WM_TRAYICON   (WM_USER + 1)
-#define ID_TRAY_EXIT  1001
-
 enum Action { ACTION_NONE, ACTION_MOVE, ACTION_RESIZE };
 
 static HHOOK          g_mouseHook;
@@ -27,8 +22,6 @@ static int            g_resizeEdgeX;  /* -1 = left, +1 = right */
 static int            g_resizeEdgeY;  /* -1 = top,  +1 = bottom */
 static DWORD          g_lastClickTime;  /* for double-click detection */
 static POINT          g_lastClickPt;
-static HWND           g_hwndMsg;
-static NOTIFYICONDATA g_nid;
 
 static BOOL IsWinKeyDown(void) {
     return (GetAsyncKeyState(VK_LWIN) & 0x8000) ||
@@ -262,64 +255,15 @@ static LRESULT CALLBACK KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
     return CallNextHookEx(g_kbHook, nCode, wParam, lParam);
 }
 
-static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    switch (msg) {
-    case WM_TRAYICON:
-        if (LOWORD(lParam) == WM_RBUTTONUP) {
-            POINT pt;
-            GetCursorPos(&pt);
-            HMENU hMenu = CreatePopupMenu();
-            AppendMenu(hMenu, MF_STRING, ID_TRAY_EXIT, TEXT("Exit WinSnap"));
-            SetForegroundWindow(hwnd);
-            TrackPopupMenu(hMenu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, NULL);
-            DestroyMenu(hMenu);
-        }
-        return 0;
-
-    case WM_COMMAND:
-        if (LOWORD(wParam) == ID_TRAY_EXIT)
-            PostQuitMessage(0);
-        return 0;
-
-    case WM_DESTROY:
-        Shell_NotifyIcon(NIM_DELETE, &g_nid);
-        PostQuitMessage(0);
-        return 0;
-    }
-    return DefWindowProc(hwnd, msg, wParam, lParam);
-}
-
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
     HANDLE mutex = CreateMutex(NULL, TRUE, TEXT("WinSnap_SingleInstance"));
     if (GetLastError() == ERROR_ALREADY_EXISTS)
         return 0;
 
-    /* Create hidden message window */
-    WNDCLASS wc = {0};
-    wc.lpfnWndProc   = WndProc;
-    wc.hInstance      = hInst;
-    wc.lpszClassName  = TEXT("WinSnapClass");
-    RegisterClass(&wc);
-
-    g_hwndMsg = CreateWindow(wc.lpszClassName, TEXT("WinSnap"), 0,
-                             0, 0, 0, 0, HWND_MESSAGE, NULL, hInst, NULL);
-
-    /* System tray icon */
-    ZeroMemory(&g_nid, sizeof(g_nid));
-    g_nid.cbSize           = sizeof(g_nid);
-    g_nid.hWnd             = g_hwndMsg;
-    g_nid.uID              = 1;
-    g_nid.uFlags           = NIF_ICON | NIF_TIP | NIF_MESSAGE;
-    g_nid.uCallbackMessage = WM_TRAYICON;
-    g_nid.hIcon            = LoadIcon(NULL, IDI_APPLICATION);
-    lstrcpy(g_nid.szTip, TEXT("WinSnap - Win+Drag/Resize windows"));
-    Shell_NotifyIcon(NIM_ADD, &g_nid);
-
     /* Install hooks */
     g_mouseHook = SetWindowsHookEx(WH_MOUSE_LL, MouseProc, hInst, 0);
     g_kbHook    = SetWindowsHookEx(WH_KEYBOARD_LL, KeyboardProc, hInst, 0);
     if (!g_mouseHook || !g_kbHook) {
-        Shell_NotifyIcon(NIM_DELETE, &g_nid);
         MessageBox(NULL, TEXT("Failed to install hooks."), TEXT("WinSnap"), MB_ICONERROR);
         return 1;
     }
@@ -332,7 +276,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
 
     UnhookWindowsHookEx(g_kbHook);
     UnhookWindowsHookEx(g_mouseHook);
-    Shell_NotifyIcon(NIM_DELETE, &g_nid);
     ReleaseMutex(mutex);
     CloseHandle(mutex);
     return 0;
